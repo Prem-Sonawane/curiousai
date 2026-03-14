@@ -2698,3 +2698,227 @@ h1, h2, h3, .sec-title, .dh-stream, .ob-pitch h1 {
   transform: translateY(-1px);
 }
 .adm-card-delete:disabled { opacity: .45; cursor: not-allowed; }
+/* ... (your existing CSS remains exactly as is, up to the last media query) ... */
+
+/* Add these new media queries at the very end of your file */
+
+/* Extra small devices (phones, less than 480px) */
+@media (max-width: 480px) {
+  /* Onboarding */
+  .onboarding {
+    grid-template-columns: 1fr; /* already at 640px, but ensure */
+  }
+  .ob-left {
+    display: none; /* hide left panel completely on phones */
+  }
+  .ob-right {
+    padding: 20px 16px;
+  }
+  .ob-card {
+    padding: 28px 20px;
+  }
+  .ob-card h2 {
+    font-size: 1.5rem;
+  }
+  .ob-field-row {
+    grid-template-columns: 1fr; /* stack age and phone vertically */
+    gap: 12px;
+  }
+  .ob-btn {
+    padding: 14px 16px;
+    font-size: 0.85rem;
+  }
+
+  /* Main app */
+  .sidebar {
+    width: 100%;
+    height: auto;
+    position: relative;
+    border-right: none;
+    border-bottom: 1px solid var(--bdr);
+  }
+  .canvas {
+    margin-left: 0;
+    width: 100%;
+  }
+  .sb-nav {
+    flex-direction: row;
+    overflow-x: auto;
+    padding: 12px;
+  }
+  .sb-step {
+    flex-shrink: 0;
+    width: auto;
+  }
+  .sbt {
+    display: none; /* hide the timeline dots on mobile */
+  }
+  .sbi {
+    padding: 8px 12px;
+  }
+
+  /* Conversation */
+  .section {
+    padding: 24px 16px;
+  }
+  .sec-title {
+    font-size: 1.8rem;
+  }
+  .chat-feed {
+    padding: 16px;
+    max-height: 50vh;
+  }
+  .msg-bub {
+    max-width: 90%;
+    font-size: 0.85rem;
+    padding: 10px 12px;
+  }
+  .cmi-zone {
+    padding: 12px 16px;
+  }
+  .cmi-btn {
+    width: 72px;
+    height: 72px;
+  }
+  .cmi-core {
+    width: 56px;
+    height: 56px;
+  }
+  .cmi-ico {
+    width: 24px;
+    height: 24px;
+  }
+  .cmi-mode-btn {
+    position: static; /* reposition if needed */
+    margin-bottom: 8px;
+  }
+
+  /* Aptitude */
+  .apt-bar {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 16px;
+    padding: 16px;
+  }
+  .apt-timer-wrap {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .apt-prog-info {
+    width: 100%;
+    flex-direction: row;
+    justify-content: space-between;
+  }
+  .q-card {
+    padding: 24px 20px;
+  }
+  .q-opts {
+    grid-template-columns: 1fr; /* stack options */
+  }
+  .q-opt {
+    padding: 12px 14px;
+    font-size: 0.85rem;
+  }
+
+  /* Professions */
+  .prof-layout {
+    grid-template-columns: 1fr;
+  }
+  .prof-grid {
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  }
+  .prof-card {
+    padding: 18px 12px;
+  }
+  .pc-emoji {
+    font-size: 1.8rem;
+  }
+  .pc-title {
+    font-size: 0.85rem;
+  }
+  .prof-panel {
+    position: static;
+    margin-top: 20px;
+  }
+
+  /* Dashboard */
+  .dashboard {
+    grid-template-columns: 1fr;
+  }
+  .dash-sidebar {
+    position: relative;
+    width: 100%;
+    height: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--bdr);
+  }
+  .dash-main {
+    margin-left: 0;
+    width: 100%;
+  }
+  .dash-hero {
+    padding: 32px 20px;
+  }
+  .dh-stream {
+    font-size: 2.8rem;
+  }
+  .dh-meta {
+    flex-direction: column;
+    gap: 12px;
+  }
+  .dash-block {
+    padding: 32px 20px;
+  }
+  .dash-trio-row {
+    grid-template-columns: 1fr;
+    padding: 32px 20px;
+    gap: 16px;
+  }
+  .trio-apt-item {
+    grid-template-columns: 1fr 60px 36px;
+  }
+  .career-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+  }
+  .cg-item {
+    padding: 20px 12px;
+  }
+
+  /* Admin */
+  .adm-header {
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 16px 20px;
+  }
+  .adm-header-right {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .adm-stat-group {
+    display: none; /* hide stats on very small screens */
+  }
+  .adm-body {
+    padding: 20px 16px;
+  }
+  .adm-search-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .adm-grid {
+    grid-template-columns: 1fr;
+  }
+  .adm-card-info-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Also ensure that at 640px the left panel hides (already there) */
+@media (max-width: 640px) {
+  .ob-left {
+    display: none;
+  }
+  .onboarding {
+    grid-template-columns: 1fr;
+  }
+}
