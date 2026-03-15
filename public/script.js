@@ -1,13 +1,14 @@
 /**
  * CURIOUS AI v5 — Google Cloud STT + TTS + Gemini 2.0 Flash
  * Firebase Integration: Phone OTP Auth + Firestore Session Management
+ * Modified to use serverless API endpoints for API keys security.
  */
 "use strict";
 
 /* ═══════════════════════════════════════════════════════════
    FIREBASE — Initialize App, Auth, Firestore
    CDN scripts are loaded in index.html before this file.
-   Paste your Firebase config from Firebase Console below.
+   Firebase config is public – it's okay to keep here.
 ═══════════════════════════════════════════════════════════ */
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyCbG9R40uVUhXbSodWGSrgriMd7vT6ep7Y",
@@ -18,20 +19,17 @@ const FIREBASE_CONFIG = {
   appId: "1:261946209072:web:3a87e3b7e09c70c0384ef5"
 };
 
-// Initialize Firebase (compat SDK — works as plain script tags, no npm)
 firebase.initializeApp(FIREBASE_CONFIG);
 const fbAuth = firebase.auth();
 const fbDb   = firebase.firestore();
 
-// Firebase state: confirmation result from signInWithPhoneNumber
 let fbConfirmationResult = null;
-// Firestore real-time listener unsubscribe function (waiting screen)
 let fbWaitingUnsubscribe = null;
 
 const CONFIG = {
-  GEMINI_URL:     "/api/gemini",   // local endpoint
-  STT_URL:        "/api/stt",       // local endpoint
-  TTS_URL:        "/api/tts",       // local endpoint
+  GEMINI_URL:     "/api/gemini",
+  STT_URL:        "/api/stt",
+  TTS_URL:        "/api/tts",
 };
 
 /* ═══ STATE ═══════════════════════════════════════════════ */
@@ -44,10 +42,10 @@ const S = {
   reportData:null, charts:{},
 };
 
-// ── REPLACED: Groq API → Google Gemini 2.0 Flash ──
-// Includes retry with exponential backoff for 30 simultaneous users
-async function gemini(messages, maxTokens=600, temp=0.78) {
-  // ── Convert OpenAI message format → Gemini format ───────────────────
+/* ═══════════════════════════════════════════════════════════
+   Gemini – now calls our own serverless function
+═══════════════════════════════════════════════════════════ */
+async function gemini(messages, maxTokens = 600, temp = 0.78) {
   const contents = [];
   let systemText = "";
 
@@ -84,7 +82,6 @@ async function gemini(messages, maxTokens=600, temp=0.78) {
     generationConfig: { temperature: temp, maxOutputTokens: maxTokens },
   });
 
-  // ── Retry with exponential backoff ───────────────────────────────────
   const MAX_RETRIES = 4;
   let lastError;
 
@@ -96,7 +93,7 @@ async function gemini(messages, maxTokens=600, temp=0.78) {
     }
 
     try {
-      const res = await fetch(CONFIG.GEMINI_URL, {  // ← changed
+      const res = await fetch(CONFIG.GEMINI_URL, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body,
@@ -129,8 +126,9 @@ async function gemini(messages, maxTokens=600, temp=0.78) {
 
 /* ═══════════════════════════════════════════════════════════
    HELPER: Ensure response has at most 3 complete sentences.
+   Also guarantees a question mark on non‑final turns.
 ═══════════════════════════════════════════════════════════ */
-function ensureMaxThreeSentences(text) {
+function ensureMaxThreeSentences(text, isFinalTurn = false) {
   const doneIndex = text.indexOf("[DONE]");
   let mainText = text;
   let doneSuffix = "";
@@ -141,19 +139,21 @@ function ensureMaxThreeSentences(text) {
 
   // Split on . ! ? followed by space or end-of-string
   const sentences = mainText.match(/[^.!?]+[.!?](\s|$)/g);
-  if (!sentences) return text; // fallback
+  let trimmed = sentences ? sentences.slice(0, 3).join(" ").trim() : mainText;
 
-  const trimmed = sentences.slice(0, 3).join(" ").trim();
+  // If not final turn and the last character is not a question mark, append a generic question
+  if (!isFinalTurn && !trimmed.endsWith("?")) {
+    // Remove any trailing punctuation that might be a period
+    trimmed = trimmed.replace(/[.!]+$/, '').trim();
+    trimmed += " What do you think?";
+  }
+
   return doneSuffix ? trimmed + "\n\n" + doneSuffix : trimmed;
 }
 
-/* ═══ VOICE — Google Cloud STT + TTS ════════════════════════════════════
-   STT : /api/stt
-   TTS : /api/tts
-════════════════════════════════════════════════════════════════════════ */
+/* ═══ VOICE — Google Cloud STT + TTS via serverless ═════════ */
 const VOICE = {
 
-  // ── STT state ─────────────────────────────────────────────────────────
   _mediaRecorder:    null,
   _audioChunks:      [],
   _onResultCallback: null,
@@ -181,7 +181,6 @@ const VOICE = {
     .then(stream => {
       this._stream = stream;
 
-      // Fix 1: detect exact mime and store it
       let mime = 'audio/webm';
       if      (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) mime = 'audio/webm;codecs=opus';
       else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus'))  mime = 'audio/ogg;codecs=opus';
@@ -194,7 +193,6 @@ const VOICE = {
       mr.start(100);
       console.log('✅ Recording — mime:', mime);
 
-      // Fix 2: silence detection — auto-stop after 2.2s of silence
       try {
         this._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         const source   = this._audioCtx.createMediaStreamSource(stream);
@@ -254,23 +252,19 @@ const VOICE = {
     mr.stop();
   },
 
-  // ── STT now calls our serverless function ──
   async _stt(blob, mime) {
-    // Step 1: Convert blob to base64
     const arrayBuffer = await blob.arrayBuffer();
     const uint8       = new Uint8Array(arrayBuffer);
     let binary = '';
     uint8.forEach(b => binary += String.fromCharCode(b));
     const base64Audio = btoa(binary);
 
-    // Step 2: Detect encoding from mime type
     let encoding = "WEBM_OPUS";
     if      (mime.includes('ogg'))  encoding = "OGG_OPUS";
     else if (mime.includes('mp4'))  encoding = "MP4";
     else                            encoding = "WEBM_OPUS";
 
-    // Step 3: POST to our serverless function
-    const res = await fetch(CONFIG.STT_URL, {  // ← changed
+    const res = await fetch(CONFIG.STT_URL, {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -305,13 +299,11 @@ const VOICE = {
       throw new Error(e?.error?.message || `STT ${res.status}`);
     }
 
-    // Step 4: Parse response
     const data    = await res.json();
     const rawText = data.results?.[0]?.alternatives?.[0]?.transcript?.trim() ?? '';
     console.log('📝 Raw transcript:', rawText);
     if (!rawText) return '';
 
-    // Step 5: Gemini post-correction — fixes domain mishearings
     try {
       const corrected = await gemini([
         { role: 'system', content:
@@ -330,7 +322,6 @@ const VOICE = {
     }
   },
 
-  // ── TTS ────────────────────────────────────────────────────────────────
   _ttsQueue:   [],
   _ttsPlaying: false,
   _ttsAudio:   null,
@@ -340,35 +331,28 @@ const VOICE = {
     this._ttsQueue=[]; this._ttsPlaying=false;
   },
 
-  // Called when switching TO Chat mode mid-conversation — kills TTS & unblocks all inputs
   stopTTS() {
     this.stopSpeaking();
-    setInputState(false); // unlock everything immediately
+    setInputState(false);
   },
 
   speak(text) {
-    // CHAT MODE: never speak, never lock anything
     if (S.convMode === 'chat') return;
 
     let clean = cleanForTTS(text);
     if (!clean) return;
 
-    // Google Cloud TTS limit is 5000 chars — truncate at word boundary if needed
     if (clean.length > 4800) {
       clean = clean.substring(0, 4800);
       const lastSpace = clean.lastIndexOf(' ');
       if (lastSpace > 4000) clean = clean.substring(0, lastSpace);
     }
 
-    // Lock all hybrid inputs while AI speaks
     setInputState(true);
-
-    // Send entire reply as ONE TTS call — no sentence splitting
     this._ttsQueue.push(clean);
     if (!this._ttsPlaying) this._drainQueue();
   },
 
-  // ── TTS now calls our serverless function ──
   async _drainQueue() {
     if (this._ttsPlaying || this._ttsQueue.length === 0) return;
     this._ttsPlaying = true;
@@ -378,12 +362,11 @@ const VOICE = {
       this._ttsPlaying = false; this._ttsAudio = null;
       if (this._ttsQueue.length > 0) { this._drainQueue(); return; }
       if (S.convDone) return;
-      // Only unlock if still in hybrid — if user switched to chat during TTS, inputs are already free
       if (S.convMode !== 'chat') setInputState(false);
     };
 
     try {
-      const res = await fetch(CONFIG.TTS_URL, {  // ← changed
+      const res = await fetch(CONFIG.TTS_URL, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -407,7 +390,6 @@ const VOICE = {
       }
 
       const data  = await res.json();
-      // Convert base64 MP3 response → playable Blob URL
       const bytes = atob(data.audioContent);
       const arr   = new Uint8Array(bytes.length);
       for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
@@ -572,10 +554,7 @@ function initOnboarding() {
 
 /* ═══════════════════════════════════════════════════════════
    FIREBASE — PART 2: PHONE OTP VERIFICATION
-   Flow: Onboarding form → sendOTP() → OTP screen → verifyOTP()
-         → createSessionRequest() → Waiting screen → startConversation()
 ═══════════════════════════════════════════════════════════ */
-
 async function sendOTP(phoneNumber) {
   const errEl  = document.getElementById("obErr");
   const btnEl  = document.getElementById("btnBegin");
@@ -920,9 +899,10 @@ async function sendMessage() {
   ta.value=""; ta.style.height="auto"; setLock(true); setTyping(true);
   try {
     const reply = await askConversationQuestion();
-    const cleanReply = ensureMaxThreeSentences(reply);
+    const isFinal = reply.includes("[DONE]");
+    const cleanReply = ensureMaxThreeSentences(reply, isFinal);
     setTyping(false);
-    if (cleanReply.includes("[DONE]")){
+    if (isFinal){
       const final = cleanReply.replace("[DONE]","").trim();
       if(final){addAIMsg(final);addHistory("assistant",final);}
       finishConversation();
@@ -2041,9 +2021,10 @@ document.addEventListener("DOMContentLoaded",()=>{
     (async () => {
       try {
         const reply = await askConversationQuestion();
-        const cleanReply = ensureMaxThreeSentences(reply);
+        const isFinal = reply.includes('[DONE]');
+        const cleanReply = ensureMaxThreeSentences(reply, isFinal);
         setTyping(false);
-        if (cleanReply.includes('[DONE]')) {
+        if (isFinal) {
           const final = cleanReply.replace('[DONE]','').trim();
           if (final) { addAIMsg(final); addHistory('assistant', final); }
           finishConversation();
@@ -2100,9 +2081,10 @@ document.addEventListener("DOMContentLoaded",()=>{
           if (typingEl) typingEl.classList.remove('hidden');
           try {
             const reply = await askConversationQuestion();
-            const cleanReply = ensureMaxThreeSentences(reply);
+            const isFinal = reply.includes('[DONE]');
+            const cleanReply = ensureMaxThreeSentences(reply, isFinal);
             if (typingEl) typingEl.classList.add('hidden');
-            if (cleanReply.includes('[DONE]')) {
+            if (isFinal) {
               const final = cleanReply.replace('[DONE]','').trim();
               if (final) { addAIMsg(final); addHistory('assistant', final); }
               finishConversation();
