@@ -2,6 +2,9 @@
  * CURIOUS AI v5 — Google Cloud STT + TTS + Gemini 2.0 Flash
  * Firebase Integration: Phone OTP Auth + Firestore Session Management
  * Modified to use serverless API endpoints for API keys security.
+ * FIXED: Career cards and stream recommendation now truly personalised.
+ * ADDED: Auto‑Approve toggle in admin dashboard.
+ * ADDED: Retry button for report generation (no fallback defaults).
  */
 "use strict";
 
@@ -40,12 +43,13 @@ const S = {
   scores:{ numerical:0, logical:0, verbal:0, abstract:0, dataInt:0 },
   pool:[], ranked:[],
   reportData:null, charts:{},
+  generatingReport: false, // prevent multiple retries
 };
 
 /* ═══════════════════════════════════════════════════════════
-   Gemini – now calls our own serverless function
+   Gemini – now calls our own serverless function with model & purpose
 ═══════════════════════════════════════════════════════════ */
-async function gemini(messages, maxTokens = 600, temp = 0.78) {
+async function gemini(messages, maxTokens = 600, temp = 0.78, model = "gemini-2.5-flash", purpose = "general") {
   const contents = [];
   let systemText = "";
 
@@ -80,6 +84,8 @@ async function gemini(messages, maxTokens = 600, temp = 0.78) {
   const body = JSON.stringify({
     contents,
     generationConfig: { temperature: temp, maxOutputTokens: maxTokens },
+    model,
+    purpose,
   });
 
   const MAX_RETRIES = 4;
@@ -88,7 +94,7 @@ async function gemini(messages, maxTokens = 600, temp = 0.78) {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (attempt > 0) {
       const waitMs = (Math.pow(2, attempt - 1) * 1000) + (Math.random() * 1000);
-      console.warn(`⏳ Gemini rate limit — retry ${attempt}/${MAX_RETRIES} in ${Math.round(waitMs)}ms`);
+      console.warn(`⏳ Gemini retry ${attempt}/${MAX_RETRIES} in ${Math.round(waitMs)}ms`);
       await new Promise(r => setTimeout(r, waitMs));
     }
 
@@ -114,8 +120,9 @@ async function gemini(messages, maxTokens = 600, temp = 0.78) {
       return d.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
 
     } catch(err) {
-      if (err.message && err.message.includes("Rate limit")) {
-        lastError = err; continue;
+      if (err.message && (err.message.includes("Rate limit") || err.message.includes("429"))) {
+        lastError = err;
+        continue;
       }
       throw err;
     }
@@ -137,13 +144,17 @@ function ensureMaxThreeSentences(text, isFinalTurn = false) {
     doneSuffix = text.substring(doneIndex);
   }
 
-  // Split on . ! ? followed by space or end-of-string
+  // Strip numbered list items (e.g. "1. ", "2) ") and replace trailing colons with a period
+  // so the sentence regex can parse Gemini responses that use list formatting
+  mainText = mainText
+    .replace(/^\d+[.)]\s+/gm, '')
+    .replace(/:\s*(\n|$)/gm, '. ')
+    .trim();
+
   const sentences = mainText.match(/[^.!?]+[.!?](\s|$)/g);
   let trimmed = sentences ? sentences.slice(0, 3).join(" ").trim() : mainText;
 
-  // If not final turn and the last character is not a question mark, append a generic question
   if (!isFinalTurn && !trimmed.endsWith("?")) {
-    // Remove any trailing punctuation that might be a period
     trimmed = trimmed.replace(/[.!]+$/, '').trim();
     trimmed += " What do you think?";
   }
@@ -654,6 +665,9 @@ async function verifyOTP() {
   }
 }
 
+/* ═══════════════════════════════════════════════════════════
+   FIREBASE — PART 3: CREATE SESSION REQUEST with AUTO-APPROVE
+═══════════════════════════════════════════════════════════ */
 async function createSessionRequest(uid) {
   try {
     await fbDb.collection("sessionRequests").doc(uid).set({
@@ -668,8 +682,23 @@ async function createSessionRequest(uid) {
       rejectionReason: "",
     });
 
-    showWaitingScreen(uid);
-
+    // Check auto-approve setting
+    const settingsDoc = await fbDb.collection("settings").doc("global").get();
+    const autoApprove = settingsDoc.exists && settingsDoc.data().autoApprove === true;
+    if (autoApprove) {
+      await fbDb.collection("sessionRequests").doc(uid).update({ status: "approved" });
+      console.log("✅ Auto-approved session for", S.name);
+      // Start the app directly
+      document.getElementById("app").classList.remove("hidden");
+      document.getElementById("sbStudent").textContent = S.name;
+      markActive("conversation");
+      setSidebarStep("aptitude","locked");
+      setSidebarStep("professions","locked");
+      setSidebarStep("report","locked");
+      startConversation();
+    } else {
+      showWaitingScreen(uid);
+    }
   } catch(err) {
     console.error("Firestore write error:", err);
     alert("Could not submit your session request. Please check your internet connection and try again.");
@@ -731,53 +760,66 @@ function showWaitingScreen(uid) {
 }
 
 /* ═══ CONVERSATION ═══════════════════════════════════════ */
-const SYSTEM_PROMPT = `You are a career counsellor inside Curious AI, a career guidance platform for Indian Class 10 students.
+/* ═══════════════════════════════════════════════════════════
+   HARDCODED QUESTION BANK — 12 fixed questions + 1 closing.
+   Gemini only generates a warm 1-sentence acknowledgement of
+   the student's previous answer. The next question is always
+   appended from this array — never left to the AI to decide.
+═══════════════════════════════════════════════════════════ */
+const CONV_QUESTIONS = [
+  // Q1 — opener (shown immediately, no prior answer to acknowledge)
+  `Hi {name}! Really glad you're here — this isn't a test, just an honest conversation to help figure out the right path for you after Class 10. What do you genuinely enjoy doing when nobody is telling you what to do — any hobby or thing you just can't stop thinking about?`,
+  // Q2
+  `What's your favourite subject in school, and what do you like about it?`,
+  // Q3
+  `Between Science, Commerce, and Arts — which stream feels most like you, even if you're not 100% sure yet?`,
+  // Q4
+  `If you're leaning toward Science, do you feel more drawn to Physics and Maths (PCM) or Biology (PCB)? And if it's Commerce or Arts, what draws you to it?`,
+  // Q5
+  `Within that, is there a specific field that excites you — like engineering, medicine, coding, finance, or design?`,
+  // Q6
+  `When you face a problem, do you prefer figuring out the logic behind it step by step, or do you jump straight to a creative idea?`,
+  // Q7
+  `Do you prefer working alone or in a team — and are you usually the one leading or the one supporting?`,
+  // Q8
+  `Imagine yourself at 25 — what does your life look like?`,
+  // Q9
+  `What's your dream profession, even if it sounds unrealistic right now?`,
+  // Q10
+  `Is there any career or type of work you know for sure you never want to do?`,
+  // Q11
+  `Who is someone you really look up to — and what is it about them that inspires you?`,
+  // Q12
+  `What's one thing you're genuinely good at that nobody really taught you?`,
+];
 
-YOUR ONLY JOB: Ask meaningful questions across 12 turns to understand this student well enough to recommend Science, Commerce, or Arts — and within Science, whether PCM or PCB and which subdomain.
+const CONV_CLOSING = `Thank you so much, {name} — it was wonderful getting to know you! You'll now move on to a short aptitude test, so just do your best and have fun with it. Good luck!`;
 
-MANDATORY RULES — EVERY RESPONSE MUST:
-- Be exactly 2 to 3 sentences long. Never more, never less.
-- End with a question mark. (Exception: turn 12 – see below.)
-- Be complete — no cut-off sentences, no trailing ellipses.
-- Use plain English, as if spoken aloud (for Text-to-Speech).
-- Never repeat or summarise what the student just said.
-- Never use markdown, asterisks, or bullet points.
-- Never include [DONE] before turn 12.
-- **Stay within a 250‑token budget. This is a hard limit – if you exceed it, your response will be cut off mid‑sentence. Keep it concise.**
+const ACK_SYSTEM_PROMPT = `You are a warm and friendly career counsellor for Indian Class 10 students.
+The student just answered a question. Write 1 to 2 sentences acknowledging their answer in a way that feels personal and genuine — as if you actually read and understood exactly what they said.
 
-TURN SEQUENCE AND TOPICS:
-You have 11 turns to cover all the topics below. Each turn MUST introduce a NEW topic – do not ask follow‑up questions on the same topic, even if the student elaborates. Acknowledge their answer briefly, then pivot to the next topic.
+Rules:
+- Directly reference what the student said — never give a generic response like "That's great!" or "Interesting!" alone.
+- Maximum 30 words total.
+- Do NOT ask any question — a separate question will be added after your response.
+- Do NOT suggest careers or give advice.
+- Sound warm, human, and genuinely interested — like a cool mentor who actually cares.
+- Plain English only. No markdown, no bullet points, no emojis.
 
-Topics to cover (use each once in any order, but cover them all by turn 11):
-1. Personal interests (what they enjoy outside school)
-2. Hobbies (specific activities they are passionate about)
-3. Activities they enjoy doing in their free time
-4. Future goals / what kind of life they imagine at age 25
-5. School subjects they like most and why
-6. Their inclination toward Science, Commerce, or Arts
-7. If Science, whether they lean toward PCM (Physics, Maths) or PCB (Biology)
-8. Subdomains within PCM/PCB (e.g., engineering, medicine, research)
-9. Analytical thinking vs creative thinking – which comes more naturally
-10. Leadership, teamwork, curiosity – how they work with others or explore new ideas
-11. Dream profession (pilot, navy officer, entrepreneur, scientist, designer, etc.)
-12. Closing turn: thank the student, say they will now move to the aptitude test, and wish them luck. Do NOT ask a question. End with a warm sentence, then on a NEW LINE write exactly: [DONE]
+Examples of GOOD responses:
+- Student said "I like biology and anatomy" → "Biology and anatomy is such a fascinating area — the human body really is one of the most complex things in existence!"
+- Student said "MS Dhoni" → "MS Dhoni is such an inspiring pick — his calm and composure under pressure is truly one of a kind!"
+- Student said "I don't know" → "That's completely okay — most people your age are still figuring this out, and that's totally normal!"
+- Student said "Drawing" → "Drawing is a beautiful skill — and the fact that you taught yourself makes it even more special!"
+- Student said "A rich person" → "Ha, nothing wrong with that ambition — wanting financial freedom is a very real and valid goal!"
 
-EXAMPLE OF A GOOD RESPONSE (turn about hobbies):
-"I notice you really enjoy sketching characters from your favourite shows. That kind of creative expression often connects to design or storytelling careers. Have you ever thought about learning digital illustration or animation?"
-
-BAD RESPONSES (will be rejected):
-- "Okay, thanks for sharing. What about..." (filler, too short)
-- "Which subject do you enjoy most?" (only one sentence, too short)
-- Any response that repeats a topic already discussed (e.g., asking a second question about the same hobby).
-
-STRICT ENFORCEMENT:
-- Count your sentences. More than 3 = failure.
-- No question mark at end (turns 1–11) = failure.
-- Incomplete sentence = failure.
-- Turn 12 must not contain a question mark – it must be a closing statement only.`;
+Examples of BAD responses (never do these):
+- "That's great!" (too generic, doesn't reference their answer)
+- "Interesting choice!" (hollow, says nothing personal)
+- "Wow, amazing!" (empty praise)`;
 
 function startConversation() {
-  const opener = `Hi ${S.name}! Really glad you're here — this isn't a test, just an honest conversation to help figure out the right path for you after Class 10.\n\nLet's start with something simple: what do you genuinely enjoy doing when nobody is telling you what to do — any hobby, activity, or thing you just can't stop thinking about?`;
+  const opener = CONV_QUESTIONS[0].replace(/{name}/g, S.name);
   addAIMsg(opener); addHistory("assistant", opener); S.qCount = 1;
   if (S.convMode === 'chat') {
     const ta = document.getElementById("chatTA");
@@ -787,10 +829,37 @@ function startConversation() {
 function addHistory(role,content){S.history.push({role,content});}
 
 async function askConversationQuestion() {
-  return await gemini(
-    [{ role: "system", content: SYSTEM_PROMPT }, ...S.history],
-    600, 0.7
-  );
+  // qCount is 1-based. After opener (Q1), student answers → qCount becomes 2 → serve Q2, etc.
+  // When qCount > 12, serve closing message (no Gemini call needed).
+  const nextQIndex = S.qCount; // CONV_QUESTIONS index to serve next
+
+  if (nextQIndex >= CONV_QUESTIONS.length) {
+    // All 12 questions done — return closing token
+    return "[CLOSING]";
+  }
+
+  // Get the hardcoded next question
+  const nextQuestion = CONV_QUESTIONS[nextQIndex];
+
+  // Ask Gemini only for a 1-sentence warm acknowledgement of the last student answer
+  const lastUserMsg = [...S.history].reverse().find(m => m.role === "user");
+  let ack = "";
+  if (lastUserMsg) {
+    try {
+      ack = await gemini([
+        { role: "system", content: ACK_SYSTEM_PROMPT },
+        { role: "user",   content: lastUserMsg.content }
+      ], 120, 0.9);
+      // Strip any question marks Gemini sneaks in, keep full sentences
+      ack = ack.replace(/[?]/g, "").trim();
+      if (ack && !/[.!]$/.test(ack)) ack = ack + ".";
+      if (ack) ack = ack + " ";
+    } catch(e) {
+      ack = ""; // if Gemini fails, just show the question directly
+    }
+  }
+
+  return ack + nextQuestion;
 }
 
 function setInputState(locked) {
@@ -899,17 +968,20 @@ async function sendMessage() {
   ta.value=""; ta.style.height="auto"; setLock(true); setTyping(true);
   try {
     const reply = await askConversationQuestion();
-    const isFinal = reply.includes("[DONE]");
-    const cleanReply = ensureMaxThreeSentences(reply, isFinal);
     setTyping(false);
-    if (isFinal){
-      const final = cleanReply.replace("[DONE]","").trim();
-      if(final){addAIMsg(final);addHistory("assistant",final);}
-      finishConversation();
-    } else {
-      addAIMsg(cleanReply); addHistory("assistant",cleanReply); S.qCount++;
-      if(S.qCount>11)finishConversation();
+
+    if (reply === "[CLOSING]") {
+      // All 12 questions answered — show fixed closing message then finish
+      const closing = CONV_CLOSING.replace(/{name}/g, S.name);
+      addAIMsg(closing); addHistory("assistant", closing);
+      setTimeout(() => finishConversation(), 400);
+      return;
     }
+
+    // Normal turn — reply is already (ack + hardcoded question), no sentence trimming needed
+    addAIMsg(reply); addHistory("assistant", reply);
+    S.qCount++;
+
     if (S.convMode === 'chat' && !S.convDone) setLock(false);
   } catch(err){
     setTyping(false);
@@ -1003,159 +1075,200 @@ function startTimer(){
   S.timerInterval=setInterval(tick,1000);
 }
 
-/* ═══ PROFESSIONS — AI generated ════════════════════════ */
-async function initProfessions(){
-  S.ranked=[];
-  const grid=document.getElementById("profGrid");
+/* ═══ PROFESSIONS — AI generated (NO FALLBACK) ═════════════ */
+async function initProfessions() {
+  S.ranked = [];
+  const grid = document.getElementById("profGrid");
   resetSlots();
-  document.getElementById("rankCount").textContent="0";
-  document.getElementById("btnGenerate").disabled=true;
+  document.getElementById("rankCount").textContent = "0";
+  document.getElementById("btnGenerate").disabled = true;
 
-  grid.innerHTML="";
-  for(let i=0;i<10;i++){
-    const sk=document.createElement("div");
-    sk.className="prof-card prof-skeleton";
-    sk.innerHTML=`<div class="sk-emoji"></div><div class="sk-title"></div><div class="sk-desc"></div>`;
+  // Show loading skeletons
+  grid.innerHTML = "";
+  for (let i = 0; i < 10; i++) {
+    const sk = document.createElement("div");
+    sk.className = "prof-card prof-skeleton";
+    sk.innerHTML = `<div class="sk-emoji"></div><div class="sk-title"></div><div class="sk-desc"></div>`;
     grid.appendChild(sk);
   }
 
   try {
-    const convStr = S.history.filter(m=>m.role==="user").map(m=>m.content).slice(0,12).join(" | ");
-    const aptStr  = Object.entries(S.scores).map(([k,v])=>`${CAT_LABEL[k]}: ${v}%`).join(", ");
+    // Clean conversation text: remove double quotes, backslashes, newlines, and non-ASCII
+    const clean = (str) => str
+      .replace(/["\\\n\r\t]/g, ' ')
+      .replace(/[^\x20-\x7E]/g, '')
+      .substring(0, 120);
+    const convStr = S.history
+      .filter(m => m.role === "user")
+      .map(m => clean(m.content))
+      .join(" | ");
+    const aptStr = Object.entries(S.scores)
+      .map(([k, v]) => `${CAT_LABEL[k]}: ${v}%`)
+      .join(", ");
 
-    const prompt = `You are a career counsellor for Indian Class 10 students.
+    const prompt = `Generate exactly 10 career options for an Indian Class 10 student. Return ONLY a valid JSON array. No extra text.
 
-Generate exactly 10 career options. Follow this structure strictly:
+Student: ${S.name}
+Conversation: ${convStr}
+Aptitude: ${aptStr}
 
-FIRST 6 cards — Fixed trendy/high-demand careers, all PCM or PCB oriented (always include all 6):
-1. AI / Machine Learning Engineer — PCM
-2. Cybersecurity Analyst — PCM
-3. Aerospace Engineer — PCM
-4. Biomedical Engineer — PCM/PCB
-5. Data Scientist — PCM
-6. Neuroscientist / Brain Researcher — PCB
+Each object must have exactly these keys:
+- "e": emoji (string)
+- "t": career title (short, 2-4 words)
+- "d": description (one sentence, max 10 words)
+- "s": stream (PCM, PCB, Commerce, Arts, or Any)
 
-LAST 4 cards — Personalised careers based on THIS student:
-Student name: ${S.name}
-Student's own words: "${convStr}"
-Aptitude scores: ${aptStr}
-Generate 4 careers genuinely suited to what this student expressed. Can be any stream.
+Example: {"e":"🤖","t":"AI Engineer","d":"Builds intelligent systems","s":"PCM"}
 
-Rules for all 10:
-- emoji: one relevant emoji
-- title: 2-4 words max
-- description: one sharp sentence, max 10 words
-- stream: PCM / PCB / Commerce / Arts / Any
-
-Return ONLY valid JSON array, no markdown, no code fences:
-[
-  {"e":"emoji","t":"Career Title","d":"What they do in one sentence","s":"stream"},
-  ...10 items total
-]`;
+Output must be a JSON array of 10 objects. Do not include any other text.`;
 
     const raw = await gemini(
-      [{role:"system",content:"Output ONLY a valid JSON array. Nothing else. No markdown."},{role:"user",content:prompt}],
-      900, 0.7
+      [{ role: "system", content: "You are a JSON generator. Output only valid JSON arrays. Never include any other text or markdown." }, { role: "user", content: prompt }],
+      2500, // increased token limit
+      0.7,
+      "gemini-2.5-flash",
+      "careers"
     );
+
+    console.log("Raw Gemini response:", raw);
+
+    // Extract JSON array from response (in case Gemini adds anything)
+    let jsonStr = raw;
+    const match = raw.match(/\[\s*\{.*\}\s*\]/s);
+    if (match) jsonStr = match[0];
+
+    // Repair common JSON issues: unescape quotes inside string values
+    function repairJSON(str) {
+      // This is a basic repair: replace unescaped double quotes inside string values
+      // We'll use a simple regex that looks for "key": "value" and escapes any quotes inside value
+      // A more robust solution would use a JSON parser with error recovery, but this works for common cases.
+      return str.replace(/(?<!\\)"([^"]*?)(?<!\\)"/g, (match, content) => {
+        const escapedContent = content.replace(/"/g, '\\"');
+        return `"${escapedContent}"`;
+      });
+    }
 
     let pool;
     try {
-      const m = raw.match(/\[[\s\S]*\]/);
-      pool = JSON.parse(m ? m[0] : raw);
-      if (!Array.isArray(pool) || pool.length < 5) throw new Error("bad response");
-      pool = pool.slice(0,10);
-    } catch {
-      pool = [
-        {e:"🤖",t:"AI / ML Engineer",     d:"Build intelligent systems that learn and adapt",   s:"PCM"},
-        {e:"🔐",t:"Cybersecurity Analyst", d:"Protect systems and networks from cyber attacks",  s:"PCM"},
-        {e:"🚀",t:"Aerospace Engineer",    d:"Design aircraft, rockets, and space systems",      s:"PCM"},
-        {e:"🧬",t:"Biomedical Engineer",   d:"Build medical devices that save lives",            s:"PCM/PCB"},
-        {e:"📊",t:"Data Scientist",        d:"Extract insights from massive datasets",           s:"PCM"},
-        {e:"🧠",t:"Neuroscientist",        d:"Research how the brain works and heals",           s:"PCB"},
-        {e:"💻",t:"Software Engineer",     d:"Build apps and systems used by millions",          s:"PCM"},
-        {e:"🩺",t:"Doctor",                d:"Diagnose and treat patients every day",            s:"PCB"},
-        {e:"⚙️",t:"Mechanical Engineer",  d:"Design machines and mechanical systems",           s:"PCM"},
-        {e:"🎨",t:"UI/UX Designer",        d:"Design interfaces people love to use",             s:"Arts"},
-      ];
+      pool = JSON.parse(jsonStr);
+    } catch (firstError) {
+      console.warn("First parse failed, attempting repair...");
+      const repaired = repairJSON(jsonStr);
+      try {
+        pool = JSON.parse(repaired);
+      } catch (secondError) {
+        console.error("Repair also failed. Raw substring:", jsonStr.substring(0, 500));
+        throw new Error(`Invalid JSON from Gemini: ${firstError.message}`);
+      }
     }
 
+    if (!Array.isArray(pool) || pool.length !== 10) {
+      throw new Error(`Expected 10 careers, got ${pool.length}`);
+    }
     S.pool = pool;
 
-    grid.innerHTML="";
-    pool.forEach((p,i)=>{
-      const card=document.createElement("div"); card.className="prof-card";
-      card.dataset.i=i; card.style.animationDelay=`${i*0.05}s`;
-      card.innerHTML=`
-        <span class="pc-emoji">${p.e}</span>
-        <div class="pc-title">${p.t}</div>
-        <div class="pc-desc">${p.d}</div>
-        <div class="pc-stream">${p.s}</div>`;
-      card.addEventListener("click",()=>toggleProf(i,card));
+    grid.innerHTML = "";
+    pool.forEach((p, i) => {
+      const card = document.createElement("div");
+      card.className = "prof-card";
+      card.dataset.i = i;
+      card.style.animationDelay = `${i * 0.05}s`;
+      card.innerHTML = `
+        <span class="pc-emoji">${p.e || "📌"}</span>
+        <div class="pc-title">${p.t || "Career"}</div>
+        <div class="pc-desc">${p.d || ""}</div>
+        <div class="pc-stream">${p.s || "Any"}</div>`;
+      card.addEventListener("click", () => toggleProf(i, card));
       grid.appendChild(card);
     });
-
-  } catch(err) {
-    grid.innerHTML=`<div style="grid-column:span 3;color:var(--red);font-family:var(--mono);font-size:.8rem;padding:20px;">Failed to generate careers: ${err.message}</div>`;
+  } catch (err) {
+    console.error("Career generation failed:", err);
+    grid.innerHTML = `<div style="grid-column:1/-1; text-align:center; color:var(--red); padding: 2rem;">
+      ⚠️ Could not generate personalised careers: ${err.message}<br>
+      Please try again later.
+    </div>`;
+    document.getElementById("btnGenerate").disabled = true;
+    return;
   }
 
-  document.getElementById("btnGenerate").onclick=()=>{
-    markDone("professions"); markActive("report");
+  document.getElementById("btnGenerate").onclick = () => {
+    markDone("professions");
+    markActive("report");
     showDashboard();
   };
 }
 
-function toggleProf(i,card){
-  if(card.classList.contains("selected")){
-    card.classList.remove("selected"); card.querySelector(".pc-rank-badge")?.remove();
-    S.ranked=S.ranked.filter(x=>x!==i); rebuildSlots();
+function toggleProf(i, card) {
+  if (card.classList.contains("selected")) {
+    card.classList.remove("selected");
+    card.querySelector(".pc-rank-badge")?.remove();
+    S.ranked = S.ranked.filter(x => x !== i);
+    rebuildSlots();
   } else {
-    if(S.ranked.length>=5)return;
-    S.ranked.push(i); card.classList.add("selected");
-    const badge=document.createElement("span"); badge.className="pc-rank-badge"; badge.textContent=S.ranked.length; card.appendChild(badge);
-    fillSlot(S.ranked.length,i);
+    if (S.ranked.length >= 5) return;
+    S.ranked.push(i);
+    card.classList.add("selected");
+    const badge = document.createElement("span");
+    badge.className = "pc-rank-badge";
+    badge.textContent = S.ranked.length;
+    card.appendChild(badge);
+    fillSlot(S.ranked.length, i);
   }
-  document.getElementById("rankCount").textContent=S.ranked.length;
-  document.getElementById("btnGenerate").disabled=S.ranked.length<5;
+  document.getElementById("rankCount").textContent = S.ranked.length;
+  document.getElementById("btnGenerate").disabled = S.ranked.length < 5;
 }
 
-function fillSlot(rank,idx){
-  const p=S.pool[idx];
-  const slot=document.querySelector(`.pp-slot[data-r="${rank}"]`);
-  slot.className="pp-slot filled";
-  slot.innerHTML=`<span class="pps-n">#${rank}</span><span class="pps-e">${p.e}</span><span class="pps-l">${p.t}</span>`;
-  slot.onclick=()=>{const card=document.querySelector(`.prof-card[data-i="${idx}"]`);if(card)toggleProf(idx,card);};
+function fillSlot(rank, idx) {
+  const p = S.pool[idx];
+  const slot = document.querySelector(`.pp-slot[data-r="${rank}"]`);
+  slot.className = "pp-slot filled";
+  slot.innerHTML = `<span class="pps-n">#${rank}</span><span class="pps-e">${p.e}</span><span class="pps-l">${p.t}</span>`;
+  slot.onclick = () => {
+    const card = document.querySelector(`.prof-card[data-i="${idx}"]`);
+    if (card) toggleProf(idx, card);
+  };
 }
-function resetSlots(){
-  for(let r=1;r<=5;r++){
-    const s=document.querySelector(`.pp-slot[data-r="${r}"]`);
-    s.className="pp-slot"; s.innerHTML=`<span class="pps-n">#${r}</span><span class="pps-l">Not selected</span>`; s.onclick=null;
+function resetSlots() {
+  for (let r = 1; r <= 5; r++) {
+    const s = document.querySelector(`.pp-slot[data-r="${r}"]`);
+    s.className = "pp-slot";
+    s.innerHTML = `<span class="pps-n">#${r}</span><span class="pps-l">Not selected</span>`;
+    s.onclick = null;
   }
 }
-function rebuildSlots(){
+function rebuildSlots() {
   resetSlots();
-  document.querySelectorAll(".prof-card").forEach(c=>c.querySelector(".pc-rank-badge")?.remove());
-  S.ranked.forEach((idx,i)=>{
-    fillSlot(i+1,idx);
-    const card=document.querySelector(`.prof-card[data-i="${idx}"]`);
-    if(card){const b=document.createElement("span");b.className="pc-rank-badge";b.textContent=i+1;card.appendChild(b);}
+  document.querySelectorAll(".prof-card").forEach(c => c.querySelector(".pc-rank-badge")?.remove());
+  S.ranked.forEach((idx, i) => {
+    fillSlot(i + 1, idx);
+    const card = document.querySelector(`.prof-card[data-i="${idx}"]`);
+    if (card) {
+      const b = document.createElement("span");
+      b.className = "pc-rank-badge";
+      b.textContent = i + 1;
+      card.appendChild(b);
+    }
   });
-  document.getElementById("rankCount").textContent=S.ranked.length;
-  document.getElementById("btnGenerate").disabled=S.ranked.length<5;
+  document.getElementById("rankCount").textContent = S.ranked.length;
+  document.getElementById("btnGenerate").disabled = S.ranked.length < 5;
 }
 
 /* ═══ DASHBOARD ══════════════════════════════════════════ */
 function showDashboard() {
-  document.getElementById("app").style.opacity="0";
-  document.getElementById("app").style.transition="opacity 0.4s";
-  setTimeout(()=>{
-    document.getElementById("app").style.display="none";
-    const dash=document.getElementById("dashboard");
+  document.getElementById("app").style.opacity = "0";
+  document.getElementById("app").style.transition = "opacity 0.4s";
+  setTimeout(() => {
+    document.getElementById("app").style.display = "none";
+    const dash = document.getElementById("dashboard");
     dash.classList.remove("hidden");
-    dash.style.opacity="0"; dash.style.transition="opacity 0.4s";
-    requestAnimationFrame(()=>{dash.style.opacity="1";});
-    document.getElementById("dsStudentName").textContent=S.name+(S.city?` · ${S.city}`:"");
+    dash.style.opacity = "0";
+    dash.style.transition = "opacity 0.4s";
+    requestAnimationFrame(() => {
+      dash.style.opacity = "1";
+    });
+    document.getElementById("dsStudentName").textContent = S.name + (S.city ? ` · ${S.city}` : "");
     generateReport();
-  },400);
+  }, 400);
 }
 
 async function saveSessionToAdmin(reportData) {
@@ -1175,113 +1288,268 @@ async function saveSessionToAdmin(reportData) {
       completedAt: firebase.firestore.FieldValue.serverTimestamp(),
     });
     console.log("✅ Session saved to Firestore completedSessions/");
-  } catch(err) {
+  } catch (err) {
     console.warn("Firestore save failed (non-critical):", err);
   }
 }
 
-async function generateReport(){
-  document.getElementById("dashLoading").style.display="flex";
+/* ═══ GENERATE REPORT WITH RETRY BUTTON ═══════════════════ */
+async function generateReport() {
+  // Prevent multiple simultaneous retries
+  if (S.generatingReport) return;
+  S.generatingReport = true;
+
+  document.getElementById("dashLoading").style.display = "flex";
   document.getElementById("dashContent").classList.add("hidden");
 
-  const careers=S.ranked.map((idx,r)=>`#${r+1}: ${S.pool[idx].t}`).join(", ");
-  const aptStr=Object.entries(S.scores).map(([k,v])=>`${CAT_LABEL[k]}: ${v}%`).join(", ");
-  const convStr=S.history.filter(m=>m.role==="user").map(m=>m.content).slice(0,10).join(" | ");
+  const careers = S.ranked.map((idx, r) => `#${r + 1}: ${S.pool[idx].t}`).join(", ");
+  const aptStr = Object.entries(S.scores).map(([k, v]) => `${CAT_LABEL[k]}: ${v}%`).join(", ");
+  
+  const clean = (str) => str
+    .replace(/["\\\n\r\t]/g, ' ')
+    .replace(/[^\x20-\x7E]/g, '')
+    .substring(0, 100);
+  const convStr = S.history
+    .filter(m => m.role === "user")
+    .map(m => clean(m.content))
 
-  const prompt=`Generate a career analysis JSON for a Class 10 Indian student.
+    .join(" | ");
 
-Student: ${S.name}${S.city?", "+S.city:""}
-Conversation (student's own words): "${convStr}"
+  const prompt = `Generate a career analysis JSON for an Indian Class 10 student. Return ONLY valid JSON. No extra text.
+
+Student: ${S.name}${S.city ? ", " + S.city : ""}
+Conversation: "${convStr}"
 Aptitude scores: ${aptStr}
 Career choices (ranked): ${careers}
 
-Return ONLY valid JSON, no markdown, no code fences:
+Output must be a JSON object with exactly these keys:
 {
-  "streamRecommendation": "Science" or "Commerce" or "Arts",
+  "streamRecommendation": "Science (PCM)" or "Science (PCB)" or "Commerce" or "Arts",
   "subjectCombo": "e.g. PCM — Physics, Chemistry, Mathematics",
-  "interestProfile": "4-5 sentences describing this student based on their conversation. Be specific and personal.",
+  "interestProfile": "4-5 sentences describing this student. Use only plain text, no quotes inside.",
   "strengthsIdentified": ["strength1","strength2","strength3","strength4","strength5"],
   "streamScores": { "science": 0-100, "commerce": 0-100, "arts": 0-100 },
-  "detailedGuidance": "6 paragraphs separated by \\n\\n. Cover: why this stream fits them (reference conversation), what to focus on in Std 11-12, 3 specific career paths with context, entrance exams to target, one practical step right now, a direct personal closing. Be honest, specific, and motivating."
-}`;
+  "detailedGuidance": "6 paragraphs separated by \\n\\n. Use plain text, no double quotes inside. Each paragraph max 100 words."
+}
+
+IMPORTANT: Do not use double quotes (") anywhere inside the string values. Use apostrophes (') instead. Use \\n for newlines.`;
 
   try {
-    const raw=await gemini([{role:"system",content:"Output ONLY valid JSON. Nothing else."},{role:"user",content:prompt}],2400,0.42);
-    let data;
-    try { const m=raw.match(/\{[\s\S]*\}/); data=JSON.parse(m?m[0]:raw); } catch { data=fallback(); }
-    S.reportData=data;
+    const raw = await gemini(
+      [{ role: "system", content: "You are a JSON generator. Output only valid JSON objects. Never include any other text or markdown. Never use double quotes inside string values – use apostrophes instead. Use \\n for newlines." }, { role: "user", content: prompt }],
+      6000,
+      0.42,
+      "gemini-2.5-flash",
+      "report"
+    );
+    console.log("Raw report response (first 1000 chars):", raw.substring(0, 1000));
+
+    // ---------- ULTRA ROBUST JSON EXTRACTION & PARSING ----------
+    function extractJSONObject(str) {
+      if (!str) return null;
+      let start = str.indexOf('{');
+      if (start === -1) return null;
+      let braceCount = 0;
+      for (let i = start; i < str.length; i++) {
+        if (str[i] === '{') braceCount++;
+        else if (str[i] === '}') {
+          braceCount--;
+          if (braceCount === 0) {
+            return str.substring(start, i + 1);
+          }
+        }
+      }
+      return null;
+    }
+
+    function repairJSON(str) {
+      if (!str) return "";
+      let fixed = str.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
+      fixed = fixed.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+      fixed = fixed.replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":');
+      fixed = fixed.replace(/(?<!\\)"([^"]*?)(?<!\\)"/g, (match, content) => {
+        const escaped = content.replace(/"/g, '\\"');
+        return `"${escaped}"`;
+      });
+      fixed = fixed.replace(/"([^"]*?)\n([^"]*?)"/g, (match, p1, p2) => `"${p1}\\n${p2}"`);
+      return fixed;
+    }
+
+    let jsonStr = extractJSONObject(raw);
+    let data = null;
+
+    if (jsonStr) {
+      try {
+        data = JSON.parse(jsonStr);
+      } catch (e) {
+        console.warn("First parse failed, attempting repair...");
+        const repaired = repairJSON(jsonStr);
+        try {
+          data = JSON.parse(repaired);
+        } catch (e2) {
+          console.error("Repair also failed. Falling back to regex extraction.");
+        }
+      }
+    }
+
+    // If still no data, use regex to extract individual fields (but no hard defaults)
+    if (!data) {
+      console.warn("Using regex extraction to build report object.");
+      data = {};
+
+      const streamMatch = raw.match(/"streamRecommendation"\s*:\s*"([^"]+)"/);
+      if (streamMatch && ["Science (PCM)", "Science (PCB)", "Commerce", "Arts"].includes(streamMatch[1])) {
+        data.streamRecommendation = streamMatch[1];
+      } else {
+        throw new Error("Missing or invalid streamRecommendation in Gemini response");
+      }
+
+      const subjectMatch = raw.match(/"subjectCombo"\s*:\s*"([^"]+)"/);
+      if (!subjectMatch) throw new Error("Missing subjectCombo in Gemini response");
+      data.subjectCombo = subjectMatch[1];
+
+      const interestMatch = raw.match(/"interestProfile"\s*:\s*"([^"]+(?:"[^"]*")*)"/);
+      if (!interestMatch) throw new Error("Missing interestProfile in Gemini response");
+      data.interestProfile = interestMatch[1].replace(/\\n/g, "\n");
+
+      const strengthsMatch = raw.match(/"strengthsIdentified"\s*:\s*\[([^\]]+)\]/);
+      if (!strengthsMatch) throw new Error("Missing strengthsIdentified in Gemini response");
+      try {
+        data.strengthsIdentified = JSON.parse(`[${strengthsMatch[1]}]`);
+        if (!Array.isArray(data.strengthsIdentified)) throw new Error();
+      } catch (e) {
+        throw new Error("Invalid strengthsIdentified array in Gemini response");
+      }
+
+      const scoresMatch = raw.match(/"streamScores"\s*:\s*\{([^}]+)\}/);
+      if (!scoresMatch) throw new Error("Missing streamScores in Gemini response");
+      try {
+        const scoresObj = JSON.parse(`{${scoresMatch[1]}}`);
+        if (typeof scoresObj.science !== "number" || typeof scoresObj.commerce !== "number" || typeof scoresObj.arts !== "number") {
+          throw new Error();
+        }
+        data.streamScores = scoresObj;
+      } catch (e) {
+        throw new Error("Invalid streamScores object in Gemini response");
+      }
+
+      const guidanceMatch = raw.match(/"detailedGuidance"\s*:\s*"([^"]+(?:"[^"]*")*)"/);
+      if (!guidanceMatch) throw new Error("Missing detailedGuidance in Gemini response");
+      data.detailedGuidance = guidanceMatch[1].replace(/\\n/g, "\n");
+    }
+
+    // Final validation – no defaults, only strict checks
+    const requiredFields = ["streamRecommendation", "subjectCombo", "interestProfile", "strengthsIdentified", "streamScores", "detailedGuidance"];
+    for (const field of requiredFields) {
+      if (!data[field]) throw new Error(`Missing required field: ${field}`);
+    }
+    if (!["Science (PCM)", "Science (PCB)", "Commerce", "Arts"].includes(data.streamRecommendation)) {
+      throw new Error(`Invalid streamRecommendation: ${data.streamRecommendation}`);
+    }
+    if (!Array.isArray(data.strengthsIdentified) || data.strengthsIdentified.length === 0) {
+      throw new Error("strengthsIdentified must be a non-empty array");
+    }
+    if (typeof data.streamScores !== "object" ||
+        typeof data.streamScores.science !== "number" ||
+        typeof data.streamScores.commerce !== "number" ||
+        typeof data.streamScores.arts !== "number") {
+      throw new Error("streamScores must contain science, commerce, arts numbers");
+    }
+
+    S.reportData = data;
     await saveSessionToAdmin(data);
     renderDashboard(data);
-  } catch(err) {
-    document.getElementById("dashLoading").innerHTML=`<p style="color:var(--red);font-size:1rem;text-align:center;font-family:var(--mono)">Report generation failed:<br>${err.message}</p>`;
+    S.generatingReport = false;
+  } catch (err) {
+    console.error("Report generation failed:", err);
+    // Show error message with a retry button
+    document.getElementById("dashLoading").innerHTML = `
+      <div style="text-align:center;">
+        <p style="color:var(--red); font-size:1rem; font-family:var(--mono); margin-bottom:1rem;">
+          Report generation failed: ${err.message}
+        </p>
+        <button id="retryReportBtn" class="btn" style="background:var(--gold); color:#0a0a0a; padding:0.6rem 1.5rem; border-radius:2rem; font-size:0.9rem; cursor:pointer;">
+          ⟳ Try Again
+        </button>
+      </div>
+    `;
+    const retryBtn = document.getElementById("retryReportBtn");
+    if (retryBtn) {
+      retryBtn.addEventListener("click", () => {
+        document.getElementById("dashLoading").innerHTML = `
+          <div class="dl-spinner"></div>
+          <p class="dl-title">Generating your report</p>
+          <p class="dl-sub">Combining conversation insights, aptitude data, and career preferences…</p>
+        `;
+        S.generatingReport = false;
+        generateReport();
+      });
+    }
+    S.generatingReport = false;
+    return;
   }
 }
 
-function fallback(){
-  return {
-    streamRecommendation:"Science",
-    subjectCombo:"PCM — Physics, Chemistry, Mathematics",
-    interestProfile:`${S.name} demonstrates strong analytical curiosity and a desire to build things that matter. Their conversation reveals goal-oriented thinking with a preference for structured problem-solving. They show genuine interest in understanding systems — both technical and human. This profile aligns closely with engineering and applied science pathways.`,
-    strengthsIdentified:["Analytical Thinking","Problem Solving","Curiosity","Goal-Oriented","Persistence"],
-    streamScores:{science:74,commerce:52,arts:36},
-    detailedGuidance:`Based on everything you shared, Science with PCM — Physics, Chemistry, and Mathematics — is the strongest fit for your goals and thinking style.\n\nPCM is the most versatile combination after Class 10. It keeps every door open: engineering, architecture, data science, finance, and even medicine through lateral paths.\n\nYour aptitude profile shows clear strength in logical and numerical reasoning — exactly what PCM demands and rewards at every stage from Class 11 through JEE.\n\nTarget JEE Main and Advanced, BITSAT, and MHT-CET. Start Mathematics seriously from Day 1 of Class 11. It is the bottleneck subject across all competitive exams.\n\nOne practical step: pick up a JEE Foundation book for Class 11 Physics this week. Start before school starts. The students who do this have a measurable advantage.\n\nYou have clearly thought about your future. That seriousness is itself an asset. Trust the direction — and do the work.`,
-  };
-}
-
-function renderDashboard(data){
-  document.getElementById("dashLoading").style.display="none";
-  const content=document.getElementById("dashContent");
+function renderDashboard(data) {
+  document.getElementById("dashLoading").style.display = "none";
+  const content = document.getElementById("dashContent");
   content.classList.remove("hidden");
 
-  const stream=(data.streamRecommendation||"Science").trim();
+  const stream = (data.streamRecommendation || "Science").trim();
   const isScience = stream.toLowerCase().includes("science");
   const isArtsOrCommerce = !isScience;
 
-  document.getElementById("dhStream").textContent=stream;
-  document.getElementById("dhCombo").textContent=data.subjectCombo||"—";
-  document.getElementById("dhStudent").textContent=S.name+(S.city?` · ${S.city}`:"");
-  document.getElementById("dhDate").textContent=new Date().toLocaleDateString("en-IN",{year:"numeric",month:"long",day:"numeric"});
+  document.getElementById("dhStream").textContent = stream;
+  document.getElementById("dhCombo").textContent = data.subjectCombo || "—";
+  document.getElementById("dhStudent").textContent = S.name + (S.city ? ` · ${S.city}` : "");
+  document.getElementById("dhDate").textContent = new Date().toLocaleDateString("en-IN", { year: "numeric", month: "long", day: "numeric" });
 
-  const tagsEl=document.getElementById("dhTags");
-  tagsEl.innerHTML=(data.strengthsIdentified||[]).map(s=>`<span class="dh-tag">${s}</span>`).join("");
+  const tagsEl = document.getElementById("dhTags");
+  tagsEl.innerHTML = (data.strengthsIdentified || []).map(s => `<span class="dh-tag">${s}</span>`).join("");
 
-  document.getElementById("dbInterest").textContent=data.interestProfile||"";
+  document.getElementById("dbInterest").textContent = data.interestProfile || "";
 
-  const grid=document.getElementById("aptScoreGrid"); grid.innerHTML="";
-  const scores=[
+  const grid = document.getElementById("aptScoreGrid");
+  grid.innerHTML = "";
+  const scores = [
     ["Numerical",  S.scores.numerical,  "🔢"],
     ["Logical",    S.scores.logical,    "🧩"],
     ["Verbal",     S.scores.verbal,     "📖"],
     ["Abstract",   S.scores.abstract,   "🔷"],
     ["Data Intel", S.scores.dataInt,    "📊"],
   ];
-  const total=Math.round(scores.reduce((a,[,v])=>a+v,0)/scores.length);
-  const overallEl=document.createElement("div"); overallEl.className="trio-overall";
-  overallEl.innerHTML=`<span class="trio-overall-score">${total}%</span><span class="trio-overall-label">Overall · ${total>=70?"Strong":"Developing"}</span>`;
+  const total = Math.round(scores.reduce((a, [, v]) => a + v, 0) / scores.length);
+  const overallEl = document.createElement("div");
+  overallEl.className = "trio-overall";
+  overallEl.innerHTML = `<span class="trio-overall-score">${total}%</span><span class="trio-overall-label">Overall · ${total >= 70 ? "Strong" : "Developing"}</span>`;
   grid.appendChild(overallEl);
-  scores.forEach(([label,val,icon])=>{
-    const color = val>=70?"var(--gold)":val>=50?"#f5a623":"var(--red,#ef4444)";
-    const row=document.createElement("div"); row.className="trio-apt-item";
-    row.innerHTML=`
+  scores.forEach(([label, val, icon]) => {
+    const color = val >= 70 ? "var(--gold)" : val >= 50 ? "#f5a623" : "var(--red,#ef4444)";
+    const row = document.createElement("div");
+    row.className = "trio-apt-item";
+    row.innerHTML = `
       <span class="trio-apt-name">${icon} ${label}</span>
       <div class="trio-apt-track"><div class="trio-apt-fill" style="width:${val}%;background:${color}"></div></div>
       <span class="trio-apt-pct">${val}%</span>`;
     grid.appendChild(row);
   });
 
-  const cg=document.getElementById("careerGrid"); cg.innerHTML="";
-  S.ranked.forEach((idx,r)=>{
-    const p=S.pool[idx];
-    const item=document.createElement("div"); item.className="cg-item"; item.style.animationDelay=`${r*0.07}s`;
-    item.innerHTML=`<div class="cg-rank">#${r+1}</div><span class="cg-emoji">${p.e}</span><div class="cg-name">${p.t}</div><div class="cg-sub">${p.d}</div>`;
+  const cg = document.getElementById("careerGrid");
+  cg.innerHTML = "";
+  S.ranked.forEach((idx, r) => {
+    const p = S.pool[idx];
+    const item = document.createElement("div");
+    item.className = "cg-item";
+    item.style.animationDelay = `${r * 0.07}s`;
+    item.innerHTML = `<div class="cg-rank">#${r + 1}</div><span class="cg-emoji">${p.e}</span><div class="cg-name">${p.t}</div><div class="cg-sub">${p.d}</div>`;
     cg.appendChild(item);
   });
 
-  const gEl=document.getElementById("guidanceText");
-  let paras=(data.detailedGuidance||"").split(/\n\n+/).filter(p=>p.trim()).map(p=>`<p>${p.trim()}</p>`);
+  const gEl = document.getElementById("guidanceText");
+  let paras = (data.detailedGuidance || "").split(/\n\n+/).filter(p => p.trim()).map(p => `<p>${p.trim()}</p>`);
 
-  if(isArtsOrCommerce){
-    const scienceNote=`<p class="guidance-note guidance-note--info">
+  if (isArtsOrCommerce) {
+    const scienceNote = `<p class="guidance-note guidance-note--info">
       One thing worth knowing before you fully commit: Science in Class 11 keeps every door open —
       it gives you access to engineering, medicine, design, data science, <em>and</em> everything in
       Commerce and Arts as well. The reverse is not true. If you later discover a passion for
@@ -1289,11 +1557,11 @@ function renderDashboard(data){
       This is not a reason to change your path if you are genuinely clear — but if there is
       even a small pull toward STEM, Science is the safer, wider choice at this stage.
     </p>`;
-    paras.splice(1,0,scienceNote);
+    paras.splice(1, 0, scienceNote);
   }
 
-  if(isScience){
-    const cmNote=`<div class="guidance-cm-block">
+  if (isScience) {
+    const cmNote = `<div class="guidance-cm-block">
       <div class="cm-label">YOUR NEXT STEP</div>
       <p>
         One thing that makes the Science path smoother than most students realise:
@@ -1313,74 +1581,89 @@ function renderDashboard(data){
       </p>
       <div class="cm-tagline">Study + Skills · Under One Roof · Curious Minds Coaching</div>
     </div>`;
-    const insertAt=Math.min(3,paras.length);
-    paras.splice(insertAt,0,cmNote);
+    const insertAt = Math.min(3, paras.length);
+    paras.splice(insertAt, 0, cmNote);
   }
 
-  gEl.innerHTML=paras.join("");
+  gEl.innerHTML = paras.join("");
 
-  setTimeout(()=>{renderStreamChart(data.streamScores);renderRadarChart();},300);
-  setTimeout(()=>document.getElementById("dash-hero").scrollIntoView({behavior:"smooth"}),100);
+  setTimeout(() => {
+    renderStreamChart(data.streamScores);
+    renderRadarChart();
+  }, 300);
+  setTimeout(() => document.getElementById("dash-hero").scrollIntoView({ behavior: "smooth" }), 100);
 }
 
 /* ═══ CHARTS ══════════════════════════════════════════════ */
-function chartTheme(){
+function chartTheme() {
   return {
-    border: S.theme==="dark"?"rgba(255,255,255,.07)":"rgba(0,0,0,.07)",
-    text:   S.theme==="dark"?"#8888a4":"#555568",
-    surf:   S.theme==="dark"?"#13131a":"#ffffff",
+    border: S.theme === "dark" ? "rgba(255,255,255,.07)" : "rgba(0,0,0,.07)",
+    text:   S.theme === "dark" ? "#8888a4" : "#555568",
+    surf:   S.theme === "dark" ? "#13131a" : "#ffffff",
   };
 }
-function renderStreamChart(scores){
-  const ctx=document.getElementById("chartStream"); if(!ctx)return;
-  if(S.charts.stream)S.charts.stream.destroy();
-  const cd=chartTheme(); const s=scores||{science:60,commerce:50,arts:40};
-  S.charts.stream=new Chart(ctx,{
-    type:"doughnut",
-    data:{
-      labels:["Science","Commerce","Arts"],
-      datasets:[{
-        data:[s.science,s.commerce,s.arts],
-        backgroundColor:["rgba(237,245,0,.92)","rgba(250,250,247,.5)","rgba(57,255,20,.65)"],
-        borderColor:cd.surf, borderWidth:4, hoverOffset:6,
+function renderStreamChart(scores) {
+  const ctx = document.getElementById("chartStream");
+  if (!ctx) return;
+  if (S.charts.stream) S.charts.stream.destroy();
+  const cd = chartTheme();
+  const s = scores || { science: 60, commerce: 50, arts: 40 };
+  S.charts.stream = new Chart(ctx, {
+    type: "doughnut",
+    data: {
+      labels: ["Science", "Commerce", "Arts"],
+      datasets: [{
+        data: [s.science, s.commerce, s.arts],
+        backgroundColor: ["rgba(237,245,0,.92)", "rgba(250,250,247,.5)", "rgba(57,255,20,.65)"],
+        borderColor: cd.surf,
+        borderWidth: 4,
+        hoverOffset: 6,
       }],
     },
-    options:{
-      responsive:true, maintainAspectRatio:false, cutout:"72%",
-      plugins:{
-        legend:{position:"bottom",labels:{color:cd.text,font:{family:"'Space Mono'",size:10},padding:14,usePointStyle:true}},
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      cutout: "72%",
+      plugins: {
+        legend: { position: "bottom", labels: { color: cd.text, font: { family: "'Space Mono'", size: 10 }, padding: 14, usePointStyle: true } },
       },
     },
   });
 }
-function renderRadarChart(){
-  const ctx=document.getElementById("chartRadar"); if(!ctx)return;
-  if(S.charts.radar)S.charts.radar.destroy();
-  const cd=chartTheme();
-  S.charts.radar=new Chart(ctx,{
-    type:"radar",
-    data:{
-      labels:["Numerical","Logical","Verbal","Abstract","Data Int."],
-      datasets:[{
-        label:S.name,
-        data:[S.scores.numerical,S.scores.logical,S.scores.verbal,S.scores.abstract,S.scores.dataInt],
-        fill:true,
-        backgroundColor:"rgba(237,245,0,.1)",
-        borderColor:"rgba(237,245,0,.9)",
-        pointBackgroundColor:"rgba(237,245,0,1)",
-        pointBorderColor:cd.surf, pointHoverRadius:5,
+function renderRadarChart() {
+  const ctx = document.getElementById("chartRadar");
+  if (!ctx) return;
+  if (S.charts.radar) S.charts.radar.destroy();
+  const cd = chartTheme();
+  S.charts.radar = new Chart(ctx, {
+    type: "radar",
+    data: {
+      labels: ["Numerical", "Logical", "Verbal", "Abstract", "Data Int."],
+      datasets: [{
+        label: S.name,
+        data: [S.scores.numerical, S.scores.logical, S.scores.verbal, S.scores.abstract, S.scores.dataInt],
+        fill: true,
+        backgroundColor: "rgba(237,245,0,.1)",
+        borderColor: "rgba(237,245,0,.9)",
+        pointBackgroundColor: "rgba(237,245,0,1)",
+        pointBorderColor: cd.surf,
+        pointHoverRadius: 5,
       }],
     },
-    options:{
-      responsive:true, maintainAspectRatio:false,
-      plugins:{legend:{labels:{color:cd.text,font:{family:"'Space Mono'",size:10}}}},
-      scales:{r:{
-        min:0,max:100,
-        ticks:{stepSize:25,color:cd.text,backdropColor:"transparent",font:{family:"'Space Mono'",size:9}},
-        grid:{color:cd.border},
-        pointLabels:{color:cd.text,font:{family:"'Space Grotesk'",size:11}},
-        angleLines:{color:cd.border},
-      }},
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: cd.text, font: { family: "'Space Mono'", size: 10 } } } },
+      scales: {
+        r: {
+          min: 0,
+          max: 100,
+          ticks: { stepSize: 25, color: cd.text, backdropColor: "transparent", font: { family: "'Space Mono'", size: 9 } },
+          grid: { color: cd.border },
+          pointLabels: { color: cd.text, font: { family: "'Space Grotesk'", size: 11 } },
+          angleLines: { color: cd.border },
+        },
+      },
     },
   });
 }
@@ -1893,6 +2176,27 @@ async function downloadPDF() {
   setTimeout(() => URL.revokeObjectURL(blobUrl), 8000);
 }
 
+/* ═══ AUTO‑APPROVE FUNCTIONS ═══════════════════════════════ */
+async function loadAutoApproveSetting() {
+  try {
+    const doc = await fbDb.collection("settings").doc("global").get();
+    if (doc.exists && doc.data().autoApprove !== undefined) {
+      const toggle = document.getElementById("autoApproveToggle");
+      if (toggle) toggle.checked = doc.data().autoApprove;
+    }
+  } catch (err) {
+    console.warn("Failed to load auto-approve setting:", err);
+  }
+}
+
+async function saveAutoApproveSetting(value) {
+  try {
+    await fbDb.collection("settings").doc("global").set({ autoApprove: value }, { merge: true });
+  } catch (err) {
+    console.error("Failed to save auto-approve setting:", err);
+  }
+}
+
 /* ═══ INIT ════════════════════════════════════════════════ */
 document.addEventListener("DOMContentLoaded",()=>{
   initTheme();
@@ -2021,17 +2325,14 @@ document.addEventListener("DOMContentLoaded",()=>{
     (async () => {
       try {
         const reply = await askConversationQuestion();
-        const isFinal = reply.includes('[DONE]');
-        const cleanReply = ensureMaxThreeSentences(reply, isFinal);
         setTyping(false);
-        if (isFinal) {
-          const final = cleanReply.replace('[DONE]','').trim();
-          if (final) { addAIMsg(final); addHistory('assistant', final); }
-          finishConversation();
-        } else {
-          addAIMsg(cleanReply); addHistory('assistant', cleanReply); S.qCount++;
-          if (S.qCount > 11) finishConversation();
+        if (reply === '[CLOSING]') {
+          const closing = CONV_CLOSING.replace(/{name}/g, S.name);
+          addAIMsg(closing); addHistory('assistant', closing);
+          setTimeout(() => finishConversation(), 400);
+          return;
         }
+        addAIMsg(reply); addHistory('assistant', reply); S.qCount++;
       } catch(err) {
         setTyping(false);
         const ef = document.getElementById('chatFeed');
@@ -2081,17 +2382,14 @@ document.addEventListener("DOMContentLoaded",()=>{
           if (typingEl) typingEl.classList.remove('hidden');
           try {
             const reply = await askConversationQuestion();
-            const isFinal = reply.includes('[DONE]');
-            const cleanReply = ensureMaxThreeSentences(reply, isFinal);
             if (typingEl) typingEl.classList.add('hidden');
-            if (isFinal) {
-              const final = cleanReply.replace('[DONE]','').trim();
-              if (final) { addAIMsg(final); addHistory('assistant', final); }
-              finishConversation();
-            } else {
-              addAIMsg(cleanReply); addHistory('assistant', cleanReply); S.qCount++;
-              if (S.qCount > 11) finishConversation();
+            if (reply === '[CLOSING]') {
+              const closing = CONV_CLOSING.replace(/{name}/g, S.name);
+              addAIMsg(closing); addHistory('assistant', closing);
+              setTimeout(() => finishConversation(), 400);
+              return;
             }
+            addAIMsg(reply); addHistory('assistant', reply); S.qCount++;
           } catch(err) {
             if (typingEl) typingEl.classList.add('hidden');
             const ef=document.getElementById('chatFeed');
@@ -2132,10 +2430,8 @@ document.addEventListener("DOMContentLoaded",()=>{
 });
 
 /* ═══════════════════════════════════════════════════════════
-   FIREBASE — PART 5: ADMIN LOGIN (Firebase Email/Password Auth)
-   PART 4: PENDING REQUESTS + COMPLETED SESSIONS from Firestore
+   FIREBASE — ADMIN LOGIN & DASHBOARD (UPDATED with auto‑approve)
 ═══════════════════════════════════════════════════════════ */
-
 let fbPendingUnsubscribe = null;
 let fbApprovedUnsubscribe = null;
 let fbRejectedUnsubscribe = null;
@@ -2180,6 +2476,14 @@ document.addEventListener("DOMContentLoaded", () => {
       document.getElementById("onboarding").style.display = "none";
       admDash.classList.remove("hidden");
       renderAdminDashboard();
+      // Load auto‑approve setting and attach listener
+      loadAutoApproveSetting();
+      const toggle = document.getElementById("autoApproveToggle");
+      if (toggle) {
+        toggle.addEventListener("change", async (e) => {
+          await saveAutoApproveSetting(e.target.checked);
+        });
+      }
     } catch(err) {
       console.error("Admin login error:", err);
       adminErr.textContent = "Invalid credentials. Please try again.";
@@ -2221,6 +2525,8 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("admSearch").addEventListener("input", () => {
     renderAdminGrid(getCurrentFilter(), getCurrentSearch());
   });
+
+  initSortDropdown();
 
   const tabApproved = document.getElementById("admTabApproved");
   const tabRejected = document.getElementById("admTabRejected");
@@ -2265,6 +2571,239 @@ function getCurrentFilter() {
 function getCurrentSearch() {
   const el = document.getElementById("admSearch");
   return el ? el.value.toLowerCase().trim() : "";
+}
+
+/* ═══ SORT STATE ═══════════════════════════════════════════ */
+let _currentSort = "none"; // "none" | "stream" | "date"
+
+function getCurrentSort() { return _currentSort; }
+
+function initSortDropdown() {
+  const btn      = document.getElementById("admSortBtn");
+  const dropdown = document.getElementById("admSortDropdown");
+  const label    = document.getElementById("admSortLabel");
+  if (!btn || !dropdown) return;
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    dropdown.classList.toggle("hidden");
+    btn.classList.toggle("active");
+  });
+
+  document.addEventListener("click", () => {
+    dropdown.classList.add("hidden");
+    btn.classList.remove("active");
+  });
+
+  dropdown.querySelectorAll(".adm-sort-option").forEach(opt => {
+    opt.addEventListener("click", (e) => {
+      e.stopPropagation();
+      _currentSort = opt.dataset.sort;
+      const icons = { none: "⊞ ", stream: "🎓 ", date: "📅 " };
+      const names = { none: "Sort By", stream: "By Stream", date: "By Date" };
+      label.textContent = icons[_currentSort] + names[_currentSort];
+      dropdown.querySelectorAll(".adm-sort-option").forEach(o => o.classList.remove("active"));
+      opt.classList.add("active");
+      dropdown.classList.add("hidden");
+      btn.classList.remove("active");
+      renderAdminGrid(getCurrentFilter(), getCurrentSearch());
+    });
+  });
+}
+
+/* ═══ FOLDER HELPERS ═══════════════════════════════════════ */
+function getStreamFolder(session) {
+  const s = (session.reportData?.streamRecommendation || "").toLowerCase();
+  if (s.includes("science")) return "Science";
+  if (s.includes("commerce")) return "Commerce";
+  if (s.includes("arts")) return "Arts";
+  return "Pending";
+}
+
+function getDateFolder(session) {
+  const d   = new Date(session.date);
+  const now = new Date();
+  const diffDays = Math.floor((now - d) / (1000 * 60 * 60 * 24));
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  if (diffDays <= 7) return "This Week";
+  if (diffDays <= 30) return "This Month";
+  return d.toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+}
+
+function renderFolders(sessions, folderFn, folderOrder) {
+  const grid    = document.getElementById("admGrid");
+  const emptyEl = document.getElementById("admEmpty");
+  grid.innerHTML = "";
+
+  if (sessions.length === 0) {
+    emptyEl.classList.remove("hidden");
+    return;
+  }
+  emptyEl.classList.add("hidden");
+
+  // Group sessions into folders
+  const groups = {};
+  sessions.forEach(s => {
+    const key = folderFn(s);
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(s);
+  });
+
+  // Determine folder order
+  let keys = folderOrder ? folderOrder.filter(k => groups[k]) : Object.keys(groups);
+  // Add any keys not in explicit order at end
+  Object.keys(groups).forEach(k => { if (!keys.includes(k)) keys.push(k); });
+
+  keys.forEach((folderName, fi) => {
+    const items = groups[folderName];
+    if (!items || items.length === 0) return;
+
+    const folderEl = document.createElement("div");
+    folderEl.className = "adm-folder";
+    folderEl.style.animationDelay = `${fi * 0.06}s`;
+
+    const folderIcons = { "Science": "🔬", "Commerce": "📊", "Arts": "🎨", "Pending": "⏳",
+      "Today": "📅", "Yesterday": "🗓", "This Week": "📆", "This Month": "🗂" };
+    const icon = folderIcons[folderName] || "📁";
+
+    folderEl.innerHTML = `
+      <div class="adm-folder-header" data-folder="${folderName}">
+        <div class="adm-folder-left">
+          <div class="adm-folder-icon-wrap">
+            <span class="adm-folder-icon">${icon}</span>
+          </div>
+          <div>
+            <div class="adm-folder-name">${folderName}</div>
+            <div class="adm-folder-count">${items.length} student${items.length !== 1 ? "s" : ""}</div>
+          </div>
+        </div>
+        <svg class="adm-folder-chevron open" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M5 7l5 5 5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="adm-folder-body"></div>`;
+
+    const body = folderEl.querySelector(".adm-folder-body");
+    const chevron = folderEl.querySelector(".adm-folder-chevron");
+    const header = folderEl.querySelector(".adm-folder-header");
+
+    // Render cards inside folder
+    const innerGrid = document.createElement("div");
+    innerGrid.className = "adm-folder-grid";
+    items.forEach((s, idx) => {
+      const card = buildAdminCard(s, idx);
+      innerGrid.appendChild(card);
+    });
+    body.appendChild(innerGrid);
+
+    // Toggle open/close
+    header.addEventListener("click", () => {
+      const isOpen = body.classList.contains("open");
+      body.classList.toggle("open");
+      chevron.classList.toggle("open");
+    });
+
+    // Start open
+    body.classList.add("open");
+
+    folderEl.style.gridColumn = "1 / -1";
+    grid.appendChild(folderEl);
+  });
+}
+
+/* ═══ EXTRACT CARD BUILD TO REUSE ══════════════════════════ */
+function buildAdminCard(s, idx) {
+  const card = document.createElement("div");
+  card.className = "adm-card";
+  card.style.animationDelay = `${idx * 0.04}s`;
+
+  const stream    = s.reportData?.streamRecommendation || "";
+  const hasReport = !!stream;
+  const initials  = (s.name||"?").split(" ").map(w => w[0]).join("").toUpperCase().slice(0,2);
+  const dateStr   = new Date(s.date).toLocaleDateString("en-IN", {day:"numeric", month:"short", year:"numeric"});
+  const total     = s.scores ? Math.round(Object.values(s.scores).reduce((a,b)=>a+b,0)/5) : 0;
+
+  const aptBars = s.scores ? [
+    ["Numerical", s.scores.numerical],
+    ["Logical",   s.scores.logical],
+    ["Verbal",    s.scores.verbal],
+    ["Abstract",  s.scores.abstract],
+    ["Data Int.", s.scores.dataInt],
+  ].map(([label,val])=>`
+    <div class="adm-card-apt-row">
+      <span class="adm-card-apt-name">${label}</span>
+      <div class="adm-card-apt-track"><div class="adm-card-apt-fill" style="width:${val||0}%;background:${(val||0)>=70?"var(--gold)":(val||0)>=50?"#f59e0b":"var(--red,#ef4444)"}"></div></div>
+      <span class="adm-card-apt-pct">${val||0}%</span>
+    </div>`).join("") : '<div class="adm-card-apt-name" style="color:var(--txt3)">No aptitude data</div>';
+
+  card.innerHTML = `
+    <div class="adm-card-header">
+      <div class="adm-card-avatar">${initials}</div>
+      <div class="adm-card-name-wrap">
+        <div class="adm-card-name">${s.name}</div>
+        <div class="adm-card-city">${s.city || "—"}</div>
+      </div>
+      <div class="adm-card-stream-badge ${hasReport?"":"pending"}">${hasReport ? stream : "PENDING"}</div>
+    </div>
+    <div class="adm-card-body">
+      <div class="adm-card-info-row">
+        <div class="adm-card-info-item">
+          <span class="adm-card-info-label">Age</span>
+          <span class="adm-card-info-val">${s.age || "—"}</span>
+        </div>
+        <div class="adm-card-info-item">
+          <span class="adm-card-info-label">Phone</span>
+          <span class="adm-card-info-val">${s.phone || "—"}</span>
+        </div>
+        <div class="adm-card-info-item">
+          <span class="adm-card-info-label">Email</span>
+          <span class="adm-card-info-val" title="${s.email||''}">${s.email || "—"}</span>
+        </div>
+        <div class="adm-card-info-item">
+          <span class="adm-card-info-label">Overall Aptitude</span>
+          <span class="adm-card-info-val" style="color:var(--gold);font-family:var(--mono);font-weight:700">${total}%</span>
+        </div>
+      </div>
+      <div class="adm-card-apt">
+        <div class="adm-card-apt-label"><span>APTITUDE BREAKDOWN</span></div>
+        <div class="adm-card-apt-bars">${aptBars}</div>
+      </div>
+    </div>
+    <div class="adm-card-footer">
+      <span class="adm-card-date">${dateStr}</span>
+      <div style="display:flex;align-items:center;gap:.6rem;">
+        ${hasReport ? `<span class="adm-card-cta">View Full Report →</span>` : `<span class="adm-card-date" style="color:var(--txt3)">Report not generated</span>`}
+        <button class="adm-card-delete" data-docid="${s._docId || ""}">✕ Delete</button>
+      </div>
+    </div>`;
+
+  const delBtn = card.querySelector(".adm-card-delete");
+  if (delBtn) {
+    delBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const docId = e.currentTarget.dataset.docid;
+      if (!docId) { alert("Cannot delete: document ID missing."); return; }
+      if (!confirm(`Permanently delete ${s.name || "this student"}'s session? This cannot be undone.`)) return;
+      e.currentTarget.disabled = true;
+      e.currentTarget.textContent = "Deleting…";
+      try {
+        await fbDb.collection("completedSessions").doc(docId).delete();
+        _adminSessions = _adminSessions.filter(x => x._docId !== docId);
+        document.getElementById("admTotalCount").textContent    = _adminSessions.length;
+        document.getElementById("admCompleteCount").textContent = _adminSessions.filter(x => x.reportData?.streamRecommendation).length;
+        document.getElementById("admSciCount").textContent      = _adminSessions.filter(x => (x.reportData?.streamRecommendation||"").toLowerCase().includes("science")).length;
+        renderAdminGrid(getCurrentFilter(), getCurrentSearch());
+      } catch(err) {
+        console.error("Delete session error:", err);
+        e.currentTarget.disabled = false;
+        e.currentTarget.textContent = "✕ Delete";
+      }
+    });
+  }
+
+  if (hasReport) {
+    card.addEventListener("click", () => openStudentReport(s));
+  }
+  return card;
 }
 
 function listenPendingRequests() {
@@ -2501,6 +3040,7 @@ function renderAdminGrid(filter, search) {
   const sessions = _adminSessions;
   const grid     = document.getElementById("admGrid");
   const emptyEl  = document.getElementById("admEmpty");
+  const sort     = getCurrentSort();
 
   let filtered = sessions.filter(s => {
     const stream = (s.reportData?.streamRecommendation || "").toLowerCase();
@@ -2515,6 +3055,17 @@ function renderAdminGrid(filter, search) {
     return true;
   });
 
+  // ── FOLDER MODE ──
+  if (sort === "stream") {
+    renderFolders(filtered, getStreamFolder, ["Science", "Commerce", "Arts", "Pending"]);
+    return;
+  }
+  if (sort === "date") {
+    renderFolders(filtered, getDateFolder, ["Today", "Yesterday", "This Week", "This Month"]);
+    return;
+  }
+
+  // ── DEFAULT FLAT GRID ──
   grid.innerHTML = "";
   if (filtered.length === 0) {
     emptyEl.classList.remove("hidden");
@@ -2523,98 +3074,7 @@ function renderAdminGrid(filter, search) {
   emptyEl.classList.add("hidden");
 
   filtered.forEach((s, idx) => {
-    const card = document.createElement("div");
-    card.className = "adm-card";
-    card.style.animationDelay = `${idx * 0.04}s`;
-
-    const stream    = s.reportData?.streamRecommendation || "";
-    const hasReport = !!stream;
-    const initials  = (s.name||"?").split(" ").map(w => w[0]).join("").toUpperCase().slice(0,2);
-    const dateStr   = new Date(s.date).toLocaleDateString("en-IN", {day:"numeric", month:"short", year:"numeric"});
-    const total     = s.scores ? Math.round(Object.values(s.scores).reduce((a,b)=>a+b,0)/5) : 0;
-
-    const aptBars = s.scores ? [
-      ["Numerical", s.scores.numerical],
-      ["Logical",   s.scores.logical],
-      ["Verbal",    s.scores.verbal],
-      ["Abstract",  s.scores.abstract],
-      ["Data Int.", s.scores.dataInt],
-    ].map(([label,val])=>`
-      <div class="adm-card-apt-row">
-        <span class="adm-card-apt-name">${label}</span>
-        <div class="adm-card-apt-track"><div class="adm-card-apt-fill" style="width:${val||0}%;background:${(val||0)>=70?"var(--gold)":(val||0)>=50?"#f59e0b":"var(--red,#ef4444)"}"></div></div>
-        <span class="adm-card-apt-pct">${val||0}%</span>
-      </div>`).join("") : '<div class="adm-card-apt-name" style="color:var(--txt3)">No aptitude data</div>';
-
-    card.innerHTML = `
-      <div class="adm-card-header">
-        <div class="adm-card-avatar">${initials}</div>
-        <div class="adm-card-name-wrap">
-          <div class="adm-card-name">${s.name}</div>
-          <div class="adm-card-city">${s.city || "—"}</div>
-        </div>
-        <div class="adm-card-stream-badge ${hasReport?"":"pending"}">${hasReport ? stream : "PENDING"}</div>
-      </div>
-      <div class="adm-card-body">
-        <div class="adm-card-info-row">
-          <div class="adm-card-info-item">
-            <span class="adm-card-info-label">Age</span>
-            <span class="adm-card-info-val">${s.age || "—"}</span>
-          </div>
-          <div class="adm-card-info-item">
-            <span class="adm-card-info-label">Phone</span>
-            <span class="adm-card-info-val">${s.phone || "—"}</span>
-          </div>
-          <div class="adm-card-info-item">
-            <span class="adm-card-info-label">Email</span>
-            <span class="adm-card-info-val" title="${s.email||''}">${s.email || "—"}</span>
-          </div>
-          <div class="adm-card-info-item">
-            <span class="adm-card-info-label">Overall Aptitude</span>
-            <span class="adm-card-info-val" style="color:var(--gold);font-family:var(--mono);font-weight:700">${total}%</span>
-          </div>
-        </div>
-        <div class="adm-card-apt">
-          <div class="adm-card-apt-label"><span>APTITUDE BREAKDOWN</span></div>
-          <div class="adm-card-apt-bars">${aptBars}</div>
-        </div>
-      </div>
-      <div class="adm-card-footer">
-        <span class="adm-card-date">${dateStr}</span>
-        <div style="display:flex;align-items:center;gap:.6rem;">
-          ${hasReport ? `<span class="adm-card-cta">View Full Report →</span>` : `<span class="adm-card-date" style="color:var(--txt3)">Report not generated</span>`}
-          <button class="adm-card-delete" data-docid="${s._docId || ""}">✕ Delete</button>
-        </div>
-      </div>`;
-
-    const delBtn = card.querySelector(".adm-card-delete");
-    if (delBtn) {
-      delBtn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        const docId = e.currentTarget.dataset.docid;
-        if (!docId) { alert("Cannot delete: document ID missing."); return; }
-        if (!confirm(`Permanently delete ${s.name || "this student"}'s session? This cannot be undone.`)) return;
-        e.currentTarget.disabled = true;
-        e.currentTarget.textContent = "Deleting…";
-        try {
-          await fbDb.collection("completedSessions").doc(docId).delete();
-          _adminSessions = _adminSessions.filter(x => x._docId !== docId);
-          document.getElementById("admTotalCount").textContent    = _adminSessions.length;
-          document.getElementById("admCompleteCount").textContent = _adminSessions.filter(x => x.reportData?.streamRecommendation).length;
-          document.getElementById("admSciCount").textContent      = _adminSessions.filter(x => (x.reportData?.streamRecommendation||"").toLowerCase().includes("science")).length;
-          renderAdminGrid(getCurrentFilter(), getCurrentSearch());
-        } catch(err) {
-          console.error("Delete session error:", err);
-          e.currentTarget.disabled = false;
-          e.currentTarget.textContent = "✕ Delete";
-        }
-      });
-    }
-
-    if (hasReport) {
-      card.addEventListener("click", () => openStudentReport(s));
-    }
-    grid.appendChild(card);
+    grid.appendChild(buildAdminCard(s, idx));
   });
 }
 
@@ -2639,9 +3099,19 @@ function openStudentReport(session) {
   document.getElementById("dashLoading").style.display = "none";
   renderDashboard(S.reportData);
 
-  document.getElementById("btnRestart").onclick = () => {
-    dash.classList.add("hidden");
-    document.getElementById("adminDashboard").classList.remove("hidden");
-    renderAdminDashboard();
-  };
+  // Admin view: show Back to Dashboard, hide New Session
+  const btnBackAdmin = document.getElementById("btnBackAdmin");
+  const btnRestart   = document.getElementById("btnRestart");
+  if (btnBackAdmin) btnBackAdmin.classList.remove("hidden");
+  if (btnRestart)   btnRestart.classList.add("hidden");
+
+  if (btnBackAdmin) {
+    btnBackAdmin.onclick = () => {
+      dash.classList.add("hidden");
+      btnBackAdmin.classList.add("hidden");
+      if (btnRestart) btnRestart.classList.remove("hidden");
+      document.getElementById("adminDashboard").classList.remove("hidden");
+      renderAdminDashboard();
+    };
+  }
 }
